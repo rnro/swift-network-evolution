@@ -132,6 +132,8 @@ final class QUICTestHarness {
         serverLinkDelay: NetworkDuration = .zero,
         clientDrops: DatagramDrops? = nil,
         serverDrops: DatagramDrops? = nil,
+        clientDropPredicate: DatagramDropPredicate? = nil,
+        serverDropPredicate: DatagramDropPredicate? = nil,
         timeout: TimeInterval = 5.0,
         clientOptions: ProtocolOptions<QUICProtocol> = QUICProtocol.options(),
         serverOptions: ProtocolOptions<QUICProtocol> = QUICProtocol.options()
@@ -166,6 +168,7 @@ final class QUICTestHarness {
             clientBridgeOptions.setProtocolInstance(clientBridge)
             clientBridgeOptions.linkDelay = clientLinkDelay
             clientBridgeOptions.datagramDrops = clientDrops
+            clientBridgeOptions.datagramDropPredicate = clientDropPredicate
             clientParameters.defaultStack.link = .custom(clientBridgeOptions)
 
             var clientPath = PathProperties(parameters: clientParameters)
@@ -193,6 +196,7 @@ final class QUICTestHarness {
             serverBridgeOptions.setProtocolInstance(serverBridge)
             serverBridgeOptions.linkDelay = serverLinkDelay
             serverBridgeOptions.datagramDrops = serverDrops
+            serverBridgeOptions.datagramDropPredicate = serverDropPredicate
             serverParameters.defaultStack.link = .custom(serverBridgeOptions)
 
             var serverPath = PathProperties(parameters: serverParameters)
@@ -894,6 +898,8 @@ final class QUICTestHarness {
         serverLinkDelay: NetworkDuration = .zero,
         clientDrops: DatagramDrops? = nil,
         serverDrops: DatagramDrops? = nil,
+        clientDropPredicate: DatagramDropPredicate? = nil,
+        serverDropPredicate: DatagramDropPredicate? = nil,
         clientReadChunkSize: Int = Int.max,
         timeout: TimeInterval = 5.0,
         applicationError: UInt64? = nil,
@@ -927,6 +933,8 @@ final class QUICTestHarness {
                 serverLinkDelay: serverLinkDelay,
                 clientDrops: clientDrops,
                 serverDrops: serverDrops,
+                clientDropPredicate: clientDropPredicate,
+                serverDropPredicate: serverDropPredicate,
                 timeout: timeout,
                 clientOptions: clientOptions,
                 serverOptions: serverOptions
@@ -1852,6 +1860,175 @@ final class QUICTestHarness {
                 timeout: timeout
             )
         }
+
+        Logger.test.debug("Test phase: Termination")
+        stop()
+    }
+
+    /// Drive `streamCount` client-initiated bidirectional streams concurrently — every stream is
+    /// opened, written to, read from and waited for in parallel, rather than sequentially as
+    /// `runQUICTest` does. Mirrors the workload shape of `swift-nio-quic`'s
+    /// `SyncIntegrationTests.testHTTP09ManyStreamsStreaming`: many requests in flight, server
+    /// constrained by `initialMaxStreamsBidirectional` and `maximumConcurrentBidirectionalStreams`.
+    ///
+    /// This intentionally does not reuse `echoDataOnStream` because that helper is barrier-based
+    /// per-stream. Reproducing the CI wedge requires the saturation phase, which only kicks in
+    /// when many client streams are in flight at once.
+    func runQUICTestConcurrentBidirectionalStreams(
+        identifier: String = #function,
+        streamCount: Int,
+        dataBlock: [UInt8],
+        clientLinkDelay: NetworkDuration = .zero,
+        serverLinkDelay: NetworkDuration = .zero,
+        clientDropPredicate: DatagramDropPredicate? = nil,
+        serverDropPredicate: DatagramDropPredicate? = nil,
+        timeout: TimeInterval = 20.0,
+        clientOptions: ProtocolOptions<QUICProtocol> = QUICProtocol.options(),
+        serverOptions: ProtocolOptions<QUICProtocol> = QUICProtocol.options()
+    ) {
+        do throws(NetworkError) {
+            try quicHandshake(
+                clientLinkDelay: clientLinkDelay,
+                serverLinkDelay: serverLinkDelay,
+                clientDropPredicate: clientDropPredicate,
+                serverDropPredicate: serverDropPredicate,
+                timeout: timeout,
+                clientOptions: clientOptions,
+                serverOptions: serverOptions
+            )
+        } catch {
+            XCTFail("Handshake must complete: \(error)")
+            return
+        }
+
+        guard let state else {
+            XCTFail("State must be non-nil after handshake")
+            return
+        }
+
+        // Server side: each new flow gets a small handler that echoes the request payload back
+        // and FINs. Per-stream completion is signalled via `serverCompletions` indexed by
+        // creation order.
+        let serverCompletions = NetworkMutex<[XCTestExpectation]>([])
+        let clientCompletions = NetworkMutex<[XCTestExpectation]>([])
+        for index in 0..<streamCount {
+            serverCompletions.withLock {
+                $0.append(XCTestExpectation(description: "server stream \(index) drains"))
+            }
+            clientCompletions.withLock {
+                $0.append(XCTestExpectation(description: "client stream \(index) drains"))
+            }
+        }
+
+        let serverFlowReady = XCTestExpectation(description: "server saw \(streamCount) flows")
+        serverFlowReady.expectedFulfillmentCount = streamCount
+        let serverDataLength = dataBlock.count
+
+        context.async {
+            for serverIndex in 0..<streamCount {
+                state.serverHarness.waitForNewFlow {
+                    guard let serverStream = state.serverHarness.upperHarnesses.last else {
+                        return
+                    }
+                    serverFlowReady.fulfill()
+
+                    var bytesRead = 0
+                    var serverHandler: ((Bool) -> Void)? = nil
+                    serverHandler = { _ in
+                        while let chunk = serverStream.read() {
+                            bytesRead += chunk.count
+                            let isFinalFlush = bytesRead >= serverDataLength
+                            _ = serverStream.write(chunk, sendFIN: isFinalFlush)
+                            if isFinalFlush {
+                                serverStream.stop()
+                                serverHandler = nil
+                                serverCompletions.withLock { $0[serverIndex].fulfill() }
+                                return
+                            }
+                        }
+                        serverStream.waitForInboundDataAvailable { _ in
+                            serverHandler?(true)
+                        }
+                    }
+                    serverHandler?(true)
+                }
+            }
+        }
+
+        // Client side: open every stream up front. Each stream writes the request, then reads
+        // until either the FIN is seen or the expected response length is met. The streams are
+        // parallel — `start(_:)` completion fires when the connection is ready, but we don't
+        // serialise on it: subsequent stream creations proceed immediately.
+        let clientStreamsReady = XCTestExpectation(description: "all client streams connected")
+        clientStreamsReady.expectedFulfillmentCount = streamCount
+
+        for index in 0..<streamCount {
+            let streamID = "C\(index + 1)"
+            let opts = clientOptions.deepCopy()
+
+            context.async {
+                opts.setLogID(prefix: streamID, parent: "", protocolLogIDNumber: 1)
+                opts.setProtocolInstance(state.clientInstance.reference)
+
+                var parameters = Parameters()
+                parameters.context = self.context
+                parameters.defaultStack.transport = .custom(opts)
+                var path = PathProperties(parameters: parameters)
+                path.effectiveMTU = 1500
+
+                let listenerLinkage = StreamListenerLinkage(reference: state.clientInstance.reference)
+                guard
+                    let stream = StreamUpperHarness(
+                        identifier: streamID,
+                        local: self.clientEndpoint,
+                        remote: self.serverEndpoint,
+                        parameters: parameters,
+                        path: path,
+                        context: self.context,
+                        listenerProtocol: listenerLinkage
+                    )
+                else {
+                    XCTFail("Failed to attach client stream \(streamID)")
+                    return
+                }
+
+                state.clientHarness.upperHarnesses.append(stream)
+
+                stream.start { connected in
+                    guard connected else { return }
+                    clientStreamsReady.fulfill()
+
+                    // Write the request and FIN our side immediately.
+                    _ = stream.write(dataBlock, sendFIN: true)
+
+                    var clientBytesRead = 0
+                    var clientHandler: ((Bool) -> Void)? = nil
+                    clientHandler = { _ in
+                        while let chunk = stream.read() {
+                            clientBytesRead += chunk.count
+                            if clientBytesRead >= serverDataLength {
+                                clientHandler = nil
+                                clientCompletions.withLock { $0[index].fulfill() }
+                                return
+                            }
+                        }
+                        stream.waitForInboundDataAvailable { _ in
+                            clientHandler?(true)
+                        }
+                    }
+                    clientHandler?(true)
+                }
+            }
+        }
+
+        wait(for: [clientStreamsReady], timeout: timeout)
+        wait(for: [serverFlowReady], timeout: timeout)
+
+        let allCompletions = serverCompletions.withLock { $0 } + clientCompletions.withLock { $0 }
+        wait(for: allCompletions, timeout: timeout)
+
+        XCTAssertEqual(state.clientHarness.upperHarnesses.count, streamCount)
+        XCTAssertEqual(state.serverHarness.upperHarnesses.count, streamCount)
 
         Logger.test.debug("Test phase: Termination")
         stop()

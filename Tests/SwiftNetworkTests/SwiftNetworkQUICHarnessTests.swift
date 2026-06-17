@@ -293,6 +293,34 @@ final class SwiftNetworkQUICHarnessTests: NetTestCase {
         )
     }
 
+    /// Targeted invariant test for the CI wedge: after a peer-initiated bidi stream is fully
+    /// closed on the server, the server must emit `MAX_STREAMS` so the client can open more
+    /// than `initialMaxStreamsBidirectional`. This is the path that stalls in
+    /// `swift-nio-quic`'s `SyncIntegrationTests.testHTTP09ManyStreamsStreaming` — the server
+    /// freezes its advertised limit at 180 because `handleStreamClose` stops firing for some
+    /// streams.
+    ///
+    /// Sequential mode is enough to surface a *baseline* break: each stream must close before
+    /// the next is opened, so if `MAX_STREAMS` is never emitted the second stream hangs.
+    /// The concurrent integration test (`testQUICManyStreamsWedgesUnderServerLoss`) covers the
+    /// load-dependent variant.
+    ///
+    /// Note: `maximumConcurrentBidirectionalStreams` must be set — the auto-MAX_STREAMS path in
+    /// `QUICConnection.handleStreamClose` is gated on that value being non-nil.
+    func testQUICStreamCloseEmitsMaxStreamsBeyondInitialBidiLimit() {
+        let serverOptions = QUICProtocol.options()
+        // Force the client to exceed the initial limit — the server must extend the limit via
+        // MAX_STREAMS as each preceding stream closes.
+        serverOptions.connectionOptions.initialMaxStreamsBidirectional = 4
+        serverOptions.connectionOptions.maximumConcurrentBidirectionalStreams = 8
+        QUICTestHarness().runQUICTest(
+            streamCount: 16,
+            dataBlock: Array("Hello World!".utf8),
+            timeout: 10.0,
+            serverOptions: serverOptions
+        )
+    }
+
     func testQUIC1000BidirectionalStreamsEcho1k() {
         let serverOptions = QUICProtocol.options()
         serverOptions.connectionOptions.initialMaxStreamsBidirectional = 1000
@@ -300,6 +328,44 @@ final class SwiftNetworkQUICHarnessTests: NetTestCase {
             streamCount: 1000,
             blockSize: 1000,
             blockCount: 1,
+            serverOptions: serverOptions
+        )
+    }
+
+    /// Reproduces the CI hang seen in `swift-nio-quic`'s
+    /// `SyncIntegrationTests.testHTTP09ManyStreamsStreaming`.
+    ///
+    /// The client opens many bidirectional streams concurrently against a server with
+    /// `initialMaxStreamsBidirectional = 180` and `maximumConcurrentBidirectionalStreams = 8`,
+    /// each carrying a small payload. A bursty server-side packet drop is injected once the
+    /// stream limit is reached so the server's stream-close acks/FINs go missing for the
+    /// final batch. On a broken build, the server's `localMaxStreams` saturates at 180, the
+    /// client emits `STREAMS_BLOCKED`, and `handleStreamClose` never fires for the wedged
+    /// streams — the test then fails via timeout. On a fixed build, retransmits/zombie
+    /// recovery break the impasse and the test completes well under the timeout.
+    ///
+    /// The drop window is calibrated by datagram count after handshake. If the calibration
+    /// drifts (e.g. packet pacing changes), the test will pass spuriously rather than hang
+    /// — the focused unit tests cover the same invariant deterministically.
+    func testQUICManyStreamsWedgesUnderServerLoss() {
+        let serverOptions = QUICProtocol.options()
+        serverOptions.connectionOptions.initialMaxStreamsBidirectional = 180
+        serverOptions.connectionOptions.maximumConcurrentBidirectionalStreams = 8
+
+        // Drop a 30-datagram window once we're well past the handshake's first ~50 datagrams,
+        // i.e. once data is flowing on real streams. The constants are deliberately broad so
+        // small pacing changes don't make the test pass without re-calibration.
+        let serverDropPredicate = DatagramDropPredicate { index in
+            (1_400..<1_430).contains(index)
+        }
+
+        QUICTestHarness().runQUICTestConcurrentBidirectionalStreams(
+            streamCount: 400,
+            dataBlock: Array(repeating: UInt8(ascii: "a"), count: 32 * 5) + Array("Success".utf8),
+            clientLinkDelay: .milliseconds(1),
+            serverLinkDelay: .milliseconds(1),
+            serverDropPredicate: serverDropPredicate,
+            timeout: 20,
             serverOptions: serverOptions
         )
     }

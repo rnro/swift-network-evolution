@@ -65,6 +65,22 @@ public struct DatagramDrops: Equatable {
 
 @_spi(Essentials)
 @available(Network 0.1.0, *)
+public final class DatagramDropPredicate {
+    private let predicate: @Sendable (Int) -> Bool
+    private var datagramCount = 0
+
+    public init(_ predicate: @Sendable @escaping (_ datagramIndex: Int) -> Bool) {
+        self.predicate = predicate
+    }
+
+    func shouldDropPacket() -> Bool {
+        defer { datagramCount += 1 }
+        return predicate(datagramCount)
+    }
+}
+
+@_spi(Essentials)
+@available(Network 0.1.0, *)
 public struct BridgeDatagramProtocol: NetworkProtocol {
     public typealias Options = BridgeOptions
     public typealias Metadata = BridgeMetadata
@@ -73,6 +89,7 @@ public struct BridgeDatagramProtocol: NetworkProtocol {
     public struct BridgeOptions: PerProtocolOptions {
         public var linkDelay: NetworkDuration = .zero
         var datagramDrops: DatagramDrops?
+        var datagramDropPredicate: DatagramDropPredicate?
 
         init() {}
 
@@ -91,6 +108,12 @@ public struct BridgeDatagramProtocol: NetworkProtocol {
         }
         public func isEqual(to other: BridgeOptions, for: ProtocolCompareMode) -> Bool {
             self == other
+        }
+
+        public static func == (lhs: BridgeOptions, rhs: BridgeOptions) -> Bool {
+            lhs.linkDelay == rhs.linkDelay
+                && lhs.datagramDrops == rhs.datagramDrops
+                && lhs.datagramDropPredicate === rhs.datagramDropPredicate
         }
 
         var isDefault: Bool {
@@ -139,6 +162,7 @@ public struct BridgeDatagramProtocol: NetworkProtocol {
 
         var linkDelay: NetworkDuration = .zero
         var datagramDrops: DatagramDrops? = nil
+        var datagramDropPredicate: DatagramDropPredicate? = nil
 
         private var timerSet = false
         func deliverInboundDataAvailableEvent() {
@@ -180,6 +204,7 @@ public struct BridgeDatagramProtocol: NetworkProtocol {
             {
                 self.linkDelay = bridgeOptions.linkDelay
                 self.datagramDrops = bridgeOptions.datagramDrops
+                self.datagramDropPredicate = bridgeOptions.datagramDropPredicate
             }
             #endif
 
@@ -257,11 +282,15 @@ public struct BridgeDatagramProtocol: NetworkProtocol {
                 datagrams.finalizeAllFramesAsFailed()
                 return
             }
-            if datagramDrops != nil, !(datagramDrops?.blockPacketGeneration ?? false) {
+            let predicateActive = datagramDropPredicate != nil
+            let dropsActive = datagramDrops != nil && !(datagramDrops?.blockPacketGeneration ?? false)
+            if predicateActive || dropsActive {
                 var remainingDatagrams = FrameArray()
                 let datagramCount = datagrams.count
                 for _ in 0..<datagramCount {
-                    if datagramDrops?.shouldDropPacket() ?? false {
+                    let predicateDrop = datagramDropPredicate?.shouldDropPacket() ?? false
+                    let rangeDrop = dropsActive && (datagramDrops?.shouldDropPacket() ?? false)
+                    if predicateDrop || rangeDrop {
                         log.datapath("dropping 1 datagram to port: \(remotePort)")
                         var dropped = datagrams.popFirst()
                         dropped?.finalize(success: false)
@@ -323,6 +352,11 @@ extension ProtocolOptions<BridgeDatagramProtocol> {
     public var datagramDrops: DatagramDrops? {
         get { perProtocolOptions!.datagramDrops }
         set { perProtocolOptions!.datagramDrops = newValue }
+    }
+
+    public var datagramDropPredicate: DatagramDropPredicate? {
+        get { perProtocolOptions!.datagramDropPredicate }
+        set { perProtocolOptions!.datagramDropPredicate = newValue }
     }
 }
 
