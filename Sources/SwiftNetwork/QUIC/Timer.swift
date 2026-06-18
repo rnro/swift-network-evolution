@@ -37,8 +37,26 @@ protocol NonCopyableTimerUser: ~Copyable {
 }
 
 private struct TimerEntry: ~Copyable {
+    enum State {
+        case disabled
+        case scheduled(Scheduled)
+
+        struct Scheduled {
+            let deadline: NetworkClock.Instant
+        }
+
+        mutating func disable() {
+            self = .disabled
+        }
+
+        mutating func schedule(fromNow: NetworkDuration, timerNow: NetworkClock.Instant = .now) {
+            precondition(fromNow != .zero)
+            self = .scheduled(Scheduled(deadline: timerNow.advanced(by: fromNow)))
+        }
+    }
+
     let identifier: Timer.TimerID
-    var deadline: NetworkClock.Instant = .zero
+    var state: State = .disabled
     let description: String
     let closure: () -> Void
 
@@ -47,15 +65,13 @@ private struct TimerEntry: ~Copyable {
         self.description = description
         self.closure = closure
     }
-    var isEnabled: Bool {
-        deadline != .zero
-    }
+
     mutating func disable() {
-        deadline = .zero
+        self.state.disable()
     }
+
     mutating func schedule(fromNow: NetworkDuration, timerNow: NetworkClock.Instant = .now) {
-        precondition(fromNow != .zero)
-        self.deadline = timerNow.advanced(by: fromNow)
+        self.state.schedule(fromNow: fromNow, timerNow: timerNow)
     }
 }
 
@@ -63,10 +79,145 @@ private struct TimerEntry: ~Copyable {
 final class Timer: PrefixedLoggable {
     typealias TimerID = UInt8
 
+    /// The Timer's scheduling state.
+    ///
+    /// `.idle` means no entry is enabled and no OS wakeup is armed.
+    /// `.armed(_)` means at least one entry is enabled and the OS wakeup is
+    /// scheduled to fire at `armed.nextDeadline`. `.stopped` is terminal: it
+    /// is reached only via `stop(final: true)` and locks out further
+    /// scheduling.
+    private enum SchedulingState: CustomStringConvertible {
+        case idle
+        case armed(Armed)
+        case stopped
+
+        struct Armed {
+            let nextDeadline: NetworkClock.Instant
+        }
+
+        var nextDeadline: NetworkClock.Instant? {
+            switch self {
+            case .idle, .stopped: return nil
+            case .armed(let schedule): return schedule.nextDeadline
+            }
+        }
+
+        // MARK: - Transitions
+
+        enum StopAction {
+            case noOp
+            /// Was `.armed`, now `.idle` — caller must unschedule the OS wakeup.
+            case unscheduleOnly
+            /// Was `.idle`, now `.stopped` — caller must release entries / reference.
+            case cleanupOnly
+            /// Was `.armed`, now `.stopped` — caller must unschedule and release.
+            case unscheduleAndCleanup
+        }
+
+        mutating func stop(final: Bool) -> StopAction {
+            switch self {
+            case .armed:
+                if final {
+                    self = .stopped
+                    return .unscheduleAndCleanup
+                } else {
+                    self = .idle
+                    return .unscheduleOnly
+                }
+            case .idle:
+                if final {
+                    self = .stopped
+                    return .cleanupOnly
+                } else {
+                    return .noOp
+                }
+            case .stopped:
+                return .noOp
+            }
+        }
+
+        enum ArmAction {
+            /// No side effect needed. The associated `IgnoreReason` is purely
+            /// diagnostic — the caller should not act, but may want to log it.
+            case ignore(IgnoreReason)
+
+            /// Caller must call `scheduleWakeup(milliseconds: delta.milliseconds)`.
+            case scheduleWakeup(
+                delta: NetworkDuration,
+                newDeadline: NetworkClock.Instant,
+                oldDeadline: NetworkClock.Instant?
+            )
+
+            enum IgnoreReason {
+                /// Currently armed within `threshold` of `newDeadline`.
+                case alreadyScheduled
+                /// Terminal state; the new deadline is silently dropped.
+                case stopped
+            }
+        }
+
+        mutating func arm(
+            at newDeadline: NetworkClock.Instant,
+            now: NetworkClock.Instant,
+            threshold: NetworkDuration
+        ) -> ArmAction {
+            var delta = now.duration(to: newDeadline)
+            // Don't allow times in the past.
+            if delta < .zero { delta = .zero }
+            let armedDeadline = now + delta
+
+            switch self {
+            case .stopped:
+                return .ignore(.stopped)
+            case .idle:
+                self = .armed(.init(nextDeadline: armedDeadline))
+                return .scheduleWakeup(delta: delta, newDeadline: armedDeadline, oldDeadline: nil)
+            case .armed:
+                // Read the current armed deadline via the non-mutating accessor to avoid a CoW
+                guard let oldDeadline = self.nextDeadline else {
+                    preconditionFailure("`.armed` must carry a `nextDeadline`")
+                }
+
+                // Skip if the existing armed deadline is already within
+                // `threshold` of the new one. Only applies when the new
+                // deadline is more than `threshold` in the future — urgent
+                // (sub-threshold) deadlines always re-arm.
+                if delta > threshold {
+                    let deadlineDifference = newDeadline.duration(to: oldDeadline)
+                    if deadlineDifference < threshold && deadlineDifference > (threshold * -1) {
+                        return .ignore(.alreadyScheduled)
+                    }
+                }
+                self = .armed(.init(nextDeadline: armedDeadline))
+                return .scheduleWakeup(delta: delta, newDeadline: armedDeadline, oldDeadline: oldDeadline)
+            }
+        }
+
+        enum TimerFiredAction {
+            case proceed
+            /// Late wakeup: scheduler is `.stopped`, ignore it.
+            case ignore
+        }
+
+        func timerFired() -> TimerFiredAction {
+            switch self {
+            case .stopped: return .ignore
+            case .idle, .armed: return .proceed
+            }
+        }
+
+        var description: String {
+            switch self {
+            case .idle: return "idle"
+            case .armed(let schedule): return "armed(nextDeadline: \(schedule.nextDeadline))"
+            case .stopped: return "stopped"
+            }
+        }
+    }
+
     var log: LogPrefixer
     private var reference: ProtocolInstanceReference? = nil
     private var nextID: TimerID = 1
-    private var timerCancelled = false
     private var avoidRecalculate = false
     private var entries: NetworkUniqueDeque<TimerEntry> = .init(minimumCapacity: 4)
     #if DatapathLogging
@@ -74,7 +225,11 @@ final class Timer: PrefixedLoggable {
     #else
     private let extraDebugging = false
     #endif
-    private(set) var nextDeadline: NetworkClock.Instant = .zero
+    private var state: SchedulingState = .idle
+
+    var nextDeadline: NetworkClock.Instant? {
+        self.state.nextDeadline
+    }
 
     static let timerThreshold = NetworkDuration.milliseconds(1)
 
@@ -86,6 +241,7 @@ final class Timer: PrefixedLoggable {
     internal init(logPrefixer: LogPrefixer) {
         self.log = logPrefixer
     }
+
     func insert(
         description: String,
         fromNow: NetworkDuration = .zero,
@@ -119,18 +275,18 @@ final class Timer: PrefixedLoggable {
     }
 
     func stop(final: Bool = true) {
-        if !timerCancelled {
+        switch self.state.stop(final: final) {
+        case .noOp:
+            break
+        case .unscheduleOnly:
             log.debug("Stopping timer")
-            timerCancelled = true
             reference?.unscheduleWakeup()
-            // Clear the cached deadline so that a subsequent `recalculate()` does not
-            // short-circuit a new entry that happens to land within `timerThreshold`
-            // of the now-defunct deadline (see `recalculate(_:)` line 180-186).
-            // Without this, an `insert` after a full disable can be silently dropped
-            // as "timer already scheduled" while no wakeup is actually armed.
-            nextDeadline = .zero
-        }
-        if final {
+        case .cleanupOnly:
+            entries.removeAll()
+            reference = nil
+        case .unscheduleAndCleanup:
+            log.debug("Stopping timer")
+            reference?.unscheduleWakeup()
             entries.removeAll()
             reference = nil
         }
@@ -140,31 +296,35 @@ final class Timer: PrefixedLoggable {
         if extraDebugging {
             let entryCount = entries.count
             for i in 0..<entryCount {
-                if entries[i].isEnabled {
-                    var fromNow: NetworkDuration = .zero
-                    if entries[i].deadline > now {
-                        fromNow = now.duration(to: entries[i].deadline)
-                    }
-                    log.datapath(
-                        "timer [T\(entries[i].identifier)] desc \(entries[i].description) deadline \(entries[i].deadline) (\(fromNow) from now)"
-                    )
-                } else {
+                switch entries[i].state {
+                case .disabled:
                     log.datapath(
                         "timer [T\(entries[i].identifier)] desc \(entries[i].description) (no deadline)"
+                    )
+                case .scheduled(let entry):
+                    var fromNow: NetworkDuration = .zero
+                    if entry.deadline > now {
+                        fromNow = now.duration(to: entry.deadline)
+                    }
+                    log.datapath(
+                        "timer [T\(entries[i].identifier)] desc \(entries[i].description) deadline \(entry.deadline) (\(fromNow) from now)"
                     )
                 }
             }
         }
+
+        // Find the earliest enabled deadline, if any.
         let entryCount = entries.count
         var earliestDeadline: NetworkClock.Instant? = nil
         for i in 0..<entryCount {
-            if !entries[i].isEnabled {
+            switch entries[i].state {
+            case .disabled:
                 continue
-            }
-            if earliestDeadline == nil {
-                earliestDeadline = entries[i].deadline
-            } else if let compareDeadline = earliestDeadline, compareDeadline > entries[i].deadline {
-                earliestDeadline = entries[i].deadline
+            case .scheduled(let entry):
+                if let current = earliestDeadline, current <= entry.deadline {
+                    continue
+                }
+                earliestDeadline = entry.deadline
             }
         }
 
@@ -174,31 +334,20 @@ final class Timer: PrefixedLoggable {
             return
         }
 
-        var delta = now.duration(to: earliestDeadline)
-
-        // Don't allow times in the past
-        if delta < .zero {
-            delta = .zero
+        switch self.state.arm(at: earliestDeadline, now: now, threshold: Timer.timerThreshold) {
+        case .ignore(.alreadyScheduled):
+            log.datapath("timer already scheduled")
+        case .ignore(.stopped):
+            // `.stopped` is terminal — preserve the historical best-effort
+            // behaviour of arming nothing rather than crashing if a stray
+            // `recalculate` lands after `stop(final: true)`.
+            break
+        case .scheduleWakeup(let delta, let newDeadline, let oldDeadline):
+            log.datapath(
+                "arming timer for the next \(delta) (now \(now)), new deadline \(newDeadline) old deadline \(oldDeadline.map(String.init(describing:)) ?? "none")"
+            )
+            reference?.scheduleWakeup(milliseconds: UInt64(delta.milliseconds))
         }
-
-        // If the timer is over one millisecond in the future,
-        // check if it is redundant with the existing deadline (nextDeadline)
-        if nextDeadline != .zero, delta > Timer.timerThreshold {
-            let deadlineDifference = earliestDeadline.duration(to: nextDeadline)
-            if deadlineDifference < Timer.timerThreshold && deadlineDifference > (Timer.timerThreshold * -1) {
-                // Timer is already set to within a millisecond of where it needs to be, don't schedule it
-                log.datapath("timer already scheduled")
-                return
-            }
-        }
-
-        timerCancelled = false
-        let oldDeadline = nextDeadline
-        nextDeadline = now + delta
-        log.datapath(
-            "arming timer for the next \(delta) (now \(now)), new deadline \(nextDeadline) old deadline \(oldDeadline)"
-        )
-        reference?.scheduleWakeup(milliseconds: UInt64(delta.milliseconds))
     }
 
     private func find(_ identifier: TimerID) -> Int? {
@@ -223,10 +372,13 @@ final class Timer: PrefixedLoggable {
             return
         }
         if fromNow == .zero {
-            guard entries[index].isEnabled else {
+            switch entries[index].state {
+            case .disabled:
+                // Already disabled — leave the scheduling state untouched.
                 return
+            case .scheduled:
+                entries[index].disable()
             }
-            entries[index].disable()
         } else {
             entries[index].schedule(fromNow: fromNow, timerNow: timerNow)
         }
@@ -236,9 +388,14 @@ final class Timer: PrefixedLoggable {
     }
 
     public func timerFired(timeNow: NetworkClock.Instant = .now) {
-        if _slowPath(timerCancelled) {
+        // `.stopped` is terminal — wakeups should not fire after
+        // `stop(final: true)`, but if one races through, ignore it.
+        switch self.state.timerFired() {
+        case .ignore:
             log.fault("Timer fired after it was cancelled")
             return
+        case .proceed:
+            break
         }
         // Due to timer leeway, we might actually be running a bit early, so
         // allow 1ms of leeway.
@@ -251,23 +408,24 @@ final class Timer: PrefixedLoggable {
         }
         var index = 0
         while index < entries.count {
-            if extraDebugging {
-                if entries[index].isEnabled && entries[index].deadline > now {
+            switch entries[index].state {
+            case .disabled:
+                break
+            case .scheduled(let entry):
+                if entry.deadline <= now {
+                    if extraDebugging {
+                        log.datapath(
+                            "calling timer closure for [T\(entries[index].identifier)] (\(entries[index].description)) (deadline \(entry.deadline) <= now \(now))"
+                        )
+                    }
+                    entries[index].disable()
+                    entries[index].closure()
+                    ranOne = true
+                } else if extraDebugging {
                     log.datapath(
-                        "timer [T\(entries[index].identifier)] desc \(entries[index].description) has deadline \(entries[index].deadline) > now \(now)"
+                        "timer [T\(entries[index].identifier)] desc \(entries[index].description) has deadline \(entry.deadline) > now \(now)"
                     )
                 }
-            }
-
-            if entries[index].isEnabled && entries[index].deadline <= now {
-                if extraDebugging {
-                    log.datapath(
-                        "calling timer closure for [T\(entries[index].identifier)] (\(entries[index].description)) (deadline \(entries[index].deadline) <= now \(now))"
-                    )
-                }
-                entries[index].disable()
-                entries[index].closure()
-                ranOne = true
             }
             index += 1
         }
@@ -275,12 +433,15 @@ final class Timer: PrefixedLoggable {
         if _slowPath(!ranOne) {
             let entryCount = entries.count
             for i in 0..<entryCount {
-                log.error(
-                    "Timer [T\(entries[i].identifier)] deadline \(entries[i].deadline), now \(now)"
-                )
+                switch entries[i].state {
+                case .disabled:
+                    log.error("Timer [T\(entries[i].identifier)] disabled, now \(now)")
+                case .scheduled(let entry):
+                    log.error("Timer [T\(entries[i].identifier)] deadline \(entry.deadline), now \(now)")
+                }
             }
             log.fault(
-                "Spurious timer at \(now)), next deadline \(nextDeadline), cancelled? \(timerCancelled)"
+                "Spurious timer at \(now)), state \(self.state), next deadline \(self.nextDeadline.map(String.init(describing:)) ?? "none")"
             )
         }
         recalculate(timeNow)

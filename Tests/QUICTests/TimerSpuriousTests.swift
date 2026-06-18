@@ -139,12 +139,11 @@ final class TimerSpuriousTests: XCTestCase {
         }
         XCTAssertEqual(timer.nextDeadline, .init(milliseconds: 1000))
 
-        // Disable it. nextDeadline should fall back to .zero (no scheduled work).
+        // Disable it. nextDeadline should fall back to nil (no scheduled work).
         timer.reschedule(identifier: id, fromNow: .zero, timerNow: .zero)
-        XCTAssertEqual(
+        XCTAssertNil(
             timer.nextDeadline,
-            .zero,
-            "nextDeadline must reset when the only enabled entry is disabled"
+            "nextDeadline must clear when the only enabled entry is disabled"
         )
 
         // Confirm the closure does not fire.

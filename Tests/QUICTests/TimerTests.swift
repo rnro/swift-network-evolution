@@ -49,7 +49,7 @@ final class TimerTests: XCTestCase {
         let oneId = timer.insert(description: "one-reschedule", timerNow: .zero) {
             semaphore.signal()
         }
-        XCTAssertEqual(timer.nextDeadline, .zero)
+        XCTAssertNil(timer.nextDeadline)
         timer.reschedule(identifier: oneId, fromNow: .milliseconds(1000), timerNow: .zero)
         XCTAssertEqual(timer.nextDeadline, .init(milliseconds: 1000))
         timer.timerFired(timeNow: .init(milliseconds: 1000))
