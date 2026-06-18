@@ -123,6 +123,12 @@ final class Timer: PrefixedLoggable {
             log.debug("Stopping timer")
             timerCancelled = true
             reference?.unscheduleWakeup()
+            // Clear the cached deadline so that a subsequent `recalculate()` does not
+            // short-circuit a new entry that happens to land within `timerThreshold`
+            // of the now-defunct deadline (see `recalculate(_:)` line 180-186).
+            // Without this, an `insert` after a full disable can be silently dropped
+            // as "timer already scheduled" while no wakeup is actually armed.
+            nextDeadline = .zero
         }
         if final {
             entries.removeAll()
