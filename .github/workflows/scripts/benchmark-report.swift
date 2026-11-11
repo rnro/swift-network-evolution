@@ -182,7 +182,9 @@ func loadResults(from resultsDirectory: String) throws -> Results {
         }
 
         if let malformedLine {
-            FileHandle.standardError.write(Data("warning: ignoring \(path), which has a malformed line: \(malformedLine)\n".utf8))
+            FileHandle.standardError.write(
+                Data("warning: ignoring \(path), which has a malformed line: \(malformedLine)\n".utf8)
+            )
             continue
         }
         results[tool, default: [:]][build] = counts
@@ -299,7 +301,9 @@ func render(
     ]
     lines += details
     if !failed.isEmpty {
-        lines += ["No results for: " + failed.map { "`\($0)`" }.joined(separator: ", ") + ". See the workflow run.", ""]
+        lines += [
+            "No results for: " + failed.map { "`\($0)`" }.joined(separator: ", ") + ". See the workflow run.", "",
+        ]
     }
     return lines.joined(separator: "\n")
 }
@@ -307,7 +311,10 @@ func render(
 let arguments = CommandLine.arguments
 if arguments.count != 7 {
     FileHandle.standardError.write(
-        Data("usage: benchmark-report.swift <results-directory> <expected-tools> <base-sha> <head-sha> <swift-version> <run-url>\n".utf8)
+        Data(
+            "usage: benchmark-report.swift <results-directory> <expected-tools> <base-sha> <head-sha> <swift-version> <run-url>\n"
+                .utf8
+        )
     )
     exit(2)
 }
