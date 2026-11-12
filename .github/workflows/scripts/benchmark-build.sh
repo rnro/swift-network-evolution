@@ -39,6 +39,9 @@ pull_request_number="${4:-}"
 
 IFS=, read -r -a tools <<<"$3"
 
+# Logging is compiled out, so the counts measure the datapath and not the logger.
+traits="DisableDebugLogging,DisableErrorLogging"
+
 if [ -n "$pull_request_number" ]; then
     git fetch --quiet origin "pull/${pull_request_number}/head"
     fetched_sha="$(git rev-parse FETCH_HEAD)"
@@ -54,7 +57,7 @@ product_arguments=()
 for tool in "${tools[@]}"; do
     product_arguments+=(--product "$tool")
 done
-swift build -c release "${product_arguments[@]}"
+swift build -c release --traits "$traits" "${product_arguments[@]}"
 
 binary_directory="$(swift build -c release --show-bin-path)"
 mkdir -p "$destination"

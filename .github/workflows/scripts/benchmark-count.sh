@@ -13,17 +13,17 @@
 ##
 ##===----------------------------------------------------------------------===##
 
-# Counts the instructions and heap allocations of one benchmark tool under valgrind, which
-# makes both counts deterministic enough to compare across machines.
+# Counts the heap allocations of one benchmark tool under valgrind, which makes the count
+# deterministic enough to compare across machines.
 #
 # Usage: benchmark-count.sh <tool> <binary-directory> <results-file>
 #
-# Writes one tab-separated line per measurement to the results file:
-#   <metric: instructions|allocations> <repeat> <count>
+# Writes one tab-separated line per repeat to the results file:
+#   <repeat> <count>
 #
 # Valgrind runs the program tens of times slower, so the workloads are much smaller than a
-# timed run would use. Each count is repeated to show how far from deterministic it is, since
-# threads make some tools' instruction counts vary a little between runs.
+# timed run would use. The count is repeated to show how far from deterministic it is, since
+# threads make some tools' counts vary a little between runs.
 
 set -euo pipefail
 
@@ -36,8 +36,7 @@ tool="$1"
 binary="${2}/${tool}"
 results_file="$3"
 
-instruction_repeats=3
-allocation_repeats=2
+repeats=3
 
 tool_arguments() {
     case "$1" in
@@ -87,19 +86,13 @@ valgrind_count() {
 }
 
 record() {
-    printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"$results_file"
+    printf '%s\t%s\n' "$1" "$2" >>"$results_file"
 }
 
 : >"$results_file"
-for ((repeat = 1; repeat <= instruction_repeats; repeat++)); do
-    echo "=== ${tool} instructions repeat ${repeat} ===" >&2
-    instructions="$(valgrind_count 'instruction count' '.*Collected : \([0-9]*\).*' \
-        valgrind --tool=callgrind --fair-sched=yes --callgrind-out-file="${work_directory}/callgrind.out")"
-    record instructions "$repeat" "$instructions"
-done
-for ((repeat = 1; repeat <= allocation_repeats; repeat++)); do
+for ((repeat = 1; repeat <= repeats; repeat++)); do
     echo "=== ${tool} allocations repeat ${repeat} ===" >&2
     allocations="$(valgrind_count 'allocation count' '.*total heap usage: \([0-9,]*\) allocs.*' \
         valgrind --tool=memcheck --fair-sched=yes --leak-check=no)"
-    record allocations "$repeat" "$allocations"
+    record "$repeat" "$allocations"
 done
