@@ -16,10 +16,13 @@ permissions: {}
 on:
   issue_comment:
     types: [created]
-  # Testing trigger: a comment can only start this workflow once it is on the default branch, so
-  # a push to the test branch runs it instead. The pushed commit is measured against its merge base.
+  # Testing triggers: a comment can only start this workflow once it is on the default branch, so
+  # a push to the test branch, or any pull request, runs it instead. The commit is measured against
+  # its merge base.
   push:
     branches: [benchmark-comment-workflow-test]
+  pull_request:
+    types: [opened, reopened, synchronize]
 
 concurrency:
   # Only a benchmark request from someone who may have write access joins the pull request's group.
@@ -27,6 +30,7 @@ concurrency:
   # `authorize` job still checks the permission itself.
   group: >-
     ${{ github.event_name == 'push' && format('benchmark-{0}', github.ref_name)
+        || github.event_name == 'pull_request' && format('benchmark-{0}', github.head_ref)
         || startsWith(github.event.comment.body, '/benchmark')
         && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
         && format('benchmark-{0}', github.event.issue.number)
@@ -45,6 +49,7 @@ jobs:
     name: Authorize
     if: >-
       github.event_name == 'push'
+      || github.event_name == 'pull_request'
       || (github.event.issue.pull_request && startsWith(github.event.comment.body, '/benchmark'))
     runs-on: ubuntu-latest
     permissions:
@@ -79,7 +84,7 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           # The comment body is untrusted; it is only ever read from the environment.
           COMMENT_BODY: ${{ github.event.comment.body }}
-          COMMENT_PULL_REQUEST_NUMBER: ${{ github.event.issue.number }}
+          EVENT_PULL_REQUEST_NUMBER: ${{ github.event.issue.number || github.event.number }}
         run: |
           set -euo pipefail
 
@@ -114,7 +119,7 @@ jobs:
             base_ref="$DEFAULT_BRANCH"
             PULL_REQUEST_NUMBER=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${head_sha}/pulls" --jq '.[0].number // empty')
           else
-            PULL_REQUEST_NUMBER="$COMMENT_PULL_REQUEST_NUMBER"
+            PULL_REQUEST_NUMBER="$EVENT_PULL_REQUEST_NUMBER"
             head_sha=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST_NUMBER}" --jq '.head.sha')
             base_ref=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST_NUMBER}" --jq '.base.ref')
           fi
@@ -191,7 +196,7 @@ jobs:
           BUILD: ${{ matrix.build }}
           SHA: ${{ matrix.sha }}
           # Only the head is fetched from the pull request, and checked to be the commit that was authorized.
-          PULL_REQUEST_NUMBER: ${{ github.event_name == 'issue_comment' && matrix.build == 'head' && needs.authorize.outputs.pull_request_number || '' }}
+          PULL_REQUEST_NUMBER: ${{ github.event_name != 'push' && matrix.build == 'head' && needs.authorize.outputs.pull_request_number || '' }}
         run: |
           set -euo pipefail
 
