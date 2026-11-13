@@ -1,9 +1,9 @@
 name: Benchmark
 
 # A comment of `/benchmark [swift=6.4.1] [tools=QUICTransfer,QUICStreamLoad]` on a pull request, from
-# someone with write access, builds the pull request and its merge base, counts the
-# heap allocations of each benchmark tool under valgrind, and comments the comparison on the pull
-# request.
+# someone with write access, builds the pull request and its merge base, counts the heap
+# allocations and the retains and releases of each benchmark tool under valgrind, and comments the
+# comparison on the pull request.
 #
 # The counts are deterministic enough to compare across machines, so every tool and build runs as
 # its own job. Wall time is not measured: on a shared runner it varies by a percent or two between runs.

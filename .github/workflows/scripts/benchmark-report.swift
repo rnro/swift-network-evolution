@@ -12,7 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-// Summarizes the allocation counts that benchmark-count.sh produced as a Markdown comment.
+// Summarizes the counts that benchmark-count.sh produced as a Markdown comment.
 //
 // Usage: swift benchmark-report.swift <results-directory> <expected-tools> <base-sha> <head-sha> <swift-version> <run-url>
 //
@@ -39,6 +39,18 @@ enum Build: String {
     case head
 }
 
+enum Metric: String, CaseIterable {
+    case allocations
+    case arc
+
+    var heading: String {
+        switch self {
+        case .allocations: "Allocations"
+        case .arc: "ARC traffic"
+        }
+    }
+}
+
 enum Verdict {
     case lower
     case higher
@@ -53,7 +65,7 @@ enum Verdict {
     }
 }
 
-/// The repeated allocation counts of one build of one tool. It always holds at least one count.
+/// The repeated counts of one metric for one build of one tool. It always holds at least one count.
 struct Counts {
     private(set) var values: [Double]
 
@@ -112,21 +124,27 @@ struct Comparison {
     }
 }
 
-/// `results[tool][build]`.
-typealias Results = [String: [Build: Counts]]
+struct MetricComparison {
+    var metric: Metric
+    var comparison: Comparison
+}
 
-/// Parses `<repeat>\t<count>`. The repeat number is checked but not needed. Counts are integers,
-/// so a count such as `nan` or `1e999` is rejected.
-func parseLine(_ line: Substring) -> Double? {
+/// `results[tool][build][metric]`.
+typealias Results = [String: [Build: [Metric: Counts]]]
+
+/// Parses `<metric>\t<repeat>\t<count>`. The repeat number is checked but not needed. Counts are
+/// integers, so a count such as `nan` or `1e999` is rejected.
+func parseLine(_ line: Substring) -> (metric: Metric, count: Double)? {
     let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
-    guard fields.count == 2,
-        Int(fields[0]) != nil,
-        let count = UInt64(fields[1])
+    guard fields.count == 3,
+        let metric = Metric(rawValue: String(fields[0])),
+        Int(fields[1]) != nil,
+        let count = UInt64(fields[2])
     else {
         return nil
     }
 
-    return Double(count)
+    return (metric, Double(count))
 }
 
 /// Reads the results of every tool and build. A file with a malformed line is skipped with a warning,
@@ -148,18 +166,18 @@ func loadResults(from resultsDirectory: String) throws -> Results {
 
         let tool = String(name[..<separator])
         let contents = try String(contentsOfFile: "\(resultsDirectory)/\(path)", encoding: .utf8)
-        var counts: Counts?
+        var counts: [Metric: Counts] = [:]
         var malformedLine: Substring?
         for line in contents.split(separator: "\n") {
-            guard let count = parseLine(line) else {
+            guard let parsed = parseLine(line) else {
                 malformedLine = line
                 break
             }
 
-            if counts == nil {
-                counts = Counts(first: count)
+            if counts[parsed.metric] == nil {
+                counts[parsed.metric] = Counts(first: parsed.count)
             } else {
-                counts?.append(count)
+                counts[parsed.metric]?.append(parsed.count)
             }
         }
 
@@ -169,22 +187,32 @@ func loadResults(from resultsDirectory: String) throws -> Results {
             )
             continue
         }
-        if let counts {
-            results[tool, default: [:]][build] = counts
-        }
+        results[tool, default: [:]][build] = counts
     }
     return results
 }
 
-/// Returns the comparison for a tool, or nil if it lacks either build.
-func compare(_ results: Results, tool: String) -> Comparison? {
-    guard let base = results[tool]?[.base],
-        let head = results[tool]?[.head]
+func compare(_ results: Results, tool: String, metric: Metric) -> MetricComparison? {
+    guard let base = results[tool]?[.base]?[metric],
+        let head = results[tool]?[.head]?[metric]
     else {
         return nil
     }
 
-    return Comparison(base: base, head: head)
+    return MetricComparison(metric: metric, comparison: Comparison(base: base, head: head))
+}
+
+/// Returns a comparison for every metric, or nil if the tool lacks either build of any metric.
+func compareMetrics(of tool: String, in results: Results) -> [MetricComparison]? {
+    var comparisons: [MetricComparison] = []
+    for metric in Metric.allCases {
+        guard let comparison = compare(results, tool: tool, metric: metric) else {
+            return nil
+        }
+
+        comparisons.append(comparison)
+    }
+    return comparisons
 }
 
 func percent(_ change: Double) -> String {
@@ -203,6 +231,31 @@ func abbreviated(_ value: Double) -> String {
     return String(format: "%.0f", value)
 }
 
+func renderDetails(tool: String, comparisons: [MetricComparison]) -> [String] {
+    var lines = [
+        "<details>",
+        "<summary>\(tool)</summary>",
+        "",
+        "| | base | head | Δ | repeat spread | |",
+        "| --- | ---: | ---: | ---: | ---: | :-: |",
+    ]
+    for entry in comparisons {
+        let comparison = entry.comparison
+        lines.append(
+            "| \(entry.metric.heading) | \(abbreviated(comparison.base.median)) | \(abbreviated(comparison.head.median)) "
+                + "| \(comparison.changeText) | \(String(format: "%.2f%%", comparison.spreadPercent)) | \(comparison.verdict.symbol) |"
+        )
+    }
+    lines.append("")
+    for entry in comparisons {
+        let base = entry.comparison.base.values.map { String(format: "%.0f", $0) }.joined(separator: ", ")
+        let head = entry.comparison.head.values.map { String(format: "%.0f", $0) }.joined(separator: ", ")
+        lines.append("\(entry.metric.heading): base \(base); head \(head)  ")
+    }
+    lines += ["", "</details>", ""]
+    return lines
+}
+
 func render(
     results: Results,
     expectedTools: [String],
@@ -211,26 +264,23 @@ func render(
     swiftVersion: String,
     runURL: String
 ) -> String {
-    var table = [
-        "| Tool | base | head | Δ | repeat spread | |",
-        "| --- | ---: | ---: | ---: | ---: | :-: |",
+    let headings = Metric.allCases.map(\.heading)
+    var summary = [
+        "| Tool | \(headings.joined(separator: " | ")) |",
+        "| --- |" + String(repeating: " ---: |", count: headings.count),
     ]
-    var repeats: [String] = []
+    var details: [String] = []
     var failed: [String] = []
 
     for tool in expectedTools {
-        guard let comparison = compare(results, tool: tool) else {
+        guard let comparisons = compareMetrics(of: tool, in: results) else {
             failed.append(tool)
             continue
         }
 
-        table.append(
-            "| \(tool) | \(abbreviated(comparison.base.median)) | \(abbreviated(comparison.head.median)) "
-                + "| \(comparison.changeText) | \(String(format: "%.2f%%", comparison.spreadPercent)) | \(comparison.verdict.symbol) |"
-        )
-        let base = comparison.base.values.map { String(format: "%.0f", $0) }.joined(separator: ", ")
-        let head = comparison.head.values.map { String(format: "%.0f", $0) }.joined(separator: ", ")
-        repeats.append("\(tool): base \(base); head \(head)  ")
+        let cells = comparisons.map { "\($0.comparison.changeText) \($0.comparison.verdict.symbol)" }
+        summary.append("| \(tool) | \(cells.joined(separator: " | ")) |")
+        details += renderDetails(tool: tool, comparisons: comparisons)
     }
 
     var lines = [
@@ -238,10 +288,10 @@ func render(
         "",
         "`\(headSHA.prefix(12))` (this change) against `\(baseSHA.prefix(12))` (merge base), Swift \(swiftVersion), "
             + "[workflow run](\(runURL)). "
-            + "Counts are the heap allocations made by a short fixed workload under valgrind.",
+            + "Counts are the heap allocations and the retain and release calls made by a short fixed workload under valgrind.",
         "",
     ]
-    lines += table
+    lines += summary
     lines += [
         "",
         "\(Verdict.lower.symbol) lower, \(Verdict.higher.symbol) higher, \(Verdict.unchanged.symbol) no change: "
@@ -249,9 +299,7 @@ func render(
             + "and \(String(format: "%g", spreadMultiple)) times the variation between repeats of either build.",
         "",
     ]
-    if !repeats.isEmpty {
-        lines += ["<details>", "<summary>Counts of each repeat</summary>", ""] + repeats + ["", "</details>", ""]
-    }
+    lines += details
     if !failed.isEmpty {
         lines += [
             "No results for: " + failed.map { "`\($0)`" }.joined(separator: ", ") + ". See the workflow run.", "",

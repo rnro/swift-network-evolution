@@ -13,16 +13,20 @@
 ##
 ##===----------------------------------------------------------------------===##
 
-# Counts the heap allocations of one benchmark tool under valgrind, which makes the count
-# deterministic enough to compare across machines.
+# Counts the heap allocations and the ARC traffic of one benchmark tool under valgrind, which
+# makes both counts deterministic enough to compare across machines.
 #
 # Usage: benchmark-count.sh <tool> <binary-directory> <results-file>
 #
-# Writes one tab-separated line per repeat to the results file:
-#   <repeat> <count>
+# Writes one tab-separated line per metric and repeat to the results file:
+#   <metric: allocations|arc> <repeat> <count>
+#
+# Allocations are the calls to the allocator (malloc, calloc, realloc and the aligned variants).
+# ARC traffic is the calls to the Swift runtime's retain and release entry points. Both come from
+# the call counts that callgrind records, so one run gives both.
 #
 # Valgrind runs the program tens of times slower, so the workloads are much smaller than a
-# timed run would use. The count is repeated to show how far from deterministic it is, since
+# timed run would use. The counts are repeated to show how far from deterministic they are, since
 # threads make some tools' counts vary a little between runs.
 
 set -euo pipefail
@@ -53,19 +57,54 @@ tool_arguments() {
 arguments="$(tool_arguments "$tool")"
 work_directory="$(mktemp -d)"
 
-# Prints the first capture group of the pattern in valgrind's report. It fails if the program
-# exits with an error or reports a failed run, or if the report lacks the count. The tools print
-# a failed run on standard output and some still exit with success, so the output is checked too.
-# Call it as its own assignment, since a failure inside an argument's substitution is not an error
-# to the shell.
-valgrind_count() {
-    local description="$1" pattern="$2"
-    shift 2
-    local report output count status=0
-    report="${work_directory}/report"
+# Prints "<allocations> <arc>" from a callgrind profile: the calls recorded to the allocator and to
+# the Swift runtime's retain and release functions. The profile writes each function name once, with
+# a number, and refers to it by number afterwards.
+summarize_profile() {
+    awk '
+        /^c?fn=/ {
+            callee = ($0 ~ /^cfn=/)
+            text = substr($0, index($0, "=") + 1)
+            if (match(text, /^\([0-9]+\)/)) {
+                id = substr(text, 2, RLENGTH - 2)
+                name = substr(text, RLENGTH + 2)
+                if (name != "") names[id] = name
+                if (callee) pending = id
+            }
+            next
+        }
+        /^calls=/ {
+            if (pending != "") {
+                split($0, fields, /[= ]/)
+                calls[pending] += fields[2]
+                pending = ""
+            }
+            next
+        }
+        END {
+            for (id in calls) {
+                name = names[id]
+                if (name ~ /^swift_(nonatomic_)?((retain|release)(_n)?|(bridgeObject|unknownObject|unowned)(Retain|Release)(_n)?)$/) {
+                    arc += calls[id]
+                } else if (name ~ /^(malloc|calloc|realloc|posix_memalign|aligned_alloc|memalign)$/) {
+                    allocations += calls[id]
+                }
+            }
+            printf "%.0f %.0f\n", allocations, arc
+        }
+    ' "$1"
+}
+
+# Runs the tool under callgrind and fails if it exits with an error or reports a failed run. The
+# tools print a failed run on standard output and some still exit with success, so the output is
+# checked too.
+profile_tool() {
+    local output report status=0
     output="${work_directory}/output"
+    report="${work_directory}/report"
     # shellcheck disable=SC2086 # the arguments are deliberately split
-    "$@" "$binary" $arguments >"$output" 2>"$report" || status=$?
+    valgrind --tool=callgrind --fair-sched=yes --callgrind-out-file="$profile" \
+        "$binary" $arguments >"$output" 2>"$report" || status=$?
     tail -n 3 "$report" >&2
     if [ "$status" -ne 0 ]; then
         echo "::error::${tool} exited with status ${status} under valgrind." >&2
@@ -76,23 +115,22 @@ valgrind_count() {
         echo "::error::${tool} reported a failed run under valgrind." >&2
         exit 1
     fi
-    count="$(sed -n "s/${pattern}/\\1/p" "$report" | head -n 1 | tr -d ',')"
-    if [ -z "$count" ]; then
-        echo "::error::No ${description} in valgrind's report for ${tool}." >&2
-        sed -n '1,40p' "$report" >&2
-        exit 1
-    fi
-    echo "$count"
 }
 
 record() {
-    printf '%s\t%s\n' "$1" "$2" >>"$results_file"
+    printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"$results_file"
 }
 
+profile="${work_directory}/callgrind.out"
 : >"$results_file"
 for ((repeat = 1; repeat <= repeats; repeat++)); do
-    echo "=== ${tool} allocations repeat ${repeat} ===" >&2
-    allocations="$(valgrind_count 'allocation count' '.*total heap usage: \([0-9,]*\) allocs.*' \
-        valgrind --tool=memcheck --fair-sched=yes --leak-check=no)"
-    record "$repeat" "$allocations"
+    echo "=== ${tool} repeat ${repeat} ===" >&2
+    profile_tool
+    read -r allocations arc < <(summarize_profile "$profile")
+    if [ "$allocations" -eq 0 ] && [ "$arc" -eq 0 ]; then
+        echo "::error::No allocation or ARC calls in the callgrind profile for ${tool}." >&2
+        exit 1
+    fi
+    record allocations "$repeat" "$allocations"
+    record arc "$repeat" "$arc"
 done
