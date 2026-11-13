@@ -16,13 +16,18 @@ permissions: {}
 on:
   issue_comment:
     types: [created]
+  # Testing trigger: a comment can only start this workflow once it is on the default branch, so
+  # a push to the test branch runs it instead. The pushed commit is measured against its merge base.
+  push:
+    branches: [benchmark-comment-workflow-test]
 
 concurrency:
   # Only a benchmark request from someone who may have write access joins the pull request's group.
   # Any other comment, such as one from a stranger, must not cancel a benchmark that is running; the
   # `authorize` job still checks the permission itself.
   group: >-
-    ${{ startsWith(github.event.comment.body, '/benchmark')
+    ${{ github.event_name == 'push' && format('benchmark-{0}', github.ref_name)
+        || startsWith(github.event.comment.body, '/benchmark')
         && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
         && format('benchmark-{0}', github.event.issue.number)
         || format('ignored-{0}', github.run_id) }}
@@ -38,7 +43,9 @@ env:
 jobs:
   authorize:
     name: Authorize
-    if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/benchmark')
+    if: >-
+      github.event_name == 'push'
+      || (github.event.issue.pull_request && startsWith(github.event.comment.body, '/benchmark'))
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -52,6 +59,7 @@ jobs:
       tools_list: ${{ steps.resolve.outputs.tools_list }}
     steps:
       - name: Check the commenter can write
+        if: ${{ github.event_name == 'issue_comment' }}
         env:
           GH_TOKEN: ${{ github.token }}
           COMMENTER: ${{ github.event.comment.user.login }}
@@ -66,9 +74,12 @@ jobs:
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUSHED_SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           # The comment body is untrusted; it is only ever read from the environment.
           COMMENT_BODY: ${{ github.event.comment.body }}
-          PULL_REQUEST_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_PULL_REQUEST_NUMBER: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
 
@@ -97,8 +108,16 @@ jobs:
             ($all | split(",")) as $known
             | ($tools | split(","))
             | if all(.[]; . as $tool | $known | index($tool)) then . else error("unknown tool") end')
-          head_sha=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST_NUMBER}" --jq '.head.sha')
-          base_ref=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST_NUMBER}" --jq '.base.ref')
+          if [ "$EVENT_NAME" = "push" ]; then
+            # The pushed commit against the default branch, and the pull request that has it, if any.
+            head_sha="$PUSHED_SHA"
+            base_ref="$DEFAULT_BRANCH"
+            PULL_REQUEST_NUMBER=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${head_sha}/pulls" --jq '.[0].number // empty')
+          else
+            PULL_REQUEST_NUMBER="$COMMENT_PULL_REQUEST_NUMBER"
+            head_sha=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST_NUMBER}" --jq '.head.sha')
+            base_ref=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST_NUMBER}" --jq '.base.ref')
+          fi
           base_sha=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${base_ref}...${head_sha}" --jq '.merge_base_commit.sha')
 
           # One job per tool and build: the counts do not depend on the machine.
@@ -118,6 +137,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Acknowledge the comment
+        if: ${{ github.event_name == 'issue_comment' }}
         env:
           GH_TOKEN: ${{ github.token }}
           COMMENT_ID: ${{ github.event.comment.id }}
@@ -171,7 +191,7 @@ jobs:
           BUILD: ${{ matrix.build }}
           SHA: ${{ matrix.sha }}
           # Only the head is fetched from the pull request, and checked to be the commit that was authorized.
-          PULL_REQUEST_NUMBER: ${{ matrix.build == 'head' && needs.authorize.outputs.pull_request_number || '' }}
+          PULL_REQUEST_NUMBER: ${{ github.event_name == 'issue_comment' && matrix.build == 'head' && needs.authorize.outputs.pull_request_number || '' }}
         run: |
           set -euo pipefail
 
@@ -227,6 +247,7 @@ jobs:
             results "$TOOLS" "$BASE_SHA" "$HEAD_SHA" "$SWIFT_VERSION" "$RUN_URL" | tee report.md
           cat report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Comment on the pull request
+        if: ${{ needs.authorize.outputs.pull_request_number != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
           PULL_REQUEST_NUMBER: ${{ needs.authorize.outputs.pull_request_number }}
