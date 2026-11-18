@@ -69,7 +69,7 @@ jobs:
 
   soundness:
     name: Soundness
-    uses: swiftlang/github-workflows/.github/workflows/soundness.yml@main
+    uses: rnro/github-workflows/.github/workflows/soundness.yml@soundness-matrix
     with:
       license_header_check_project_name: "Swift"
       api_breakage_check_container_image: "swift:6.4-jammy"
