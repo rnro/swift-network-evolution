@@ -19,11 +19,11 @@ jobs:
       # Linux
       linux_swift_versions: '["6.4"]'
       linux_command: &linux_command |
-        Build: swift build --build-tests --quiet
-        Build-Additive-Traits: swift build --build-tests --quiet --traits DatapathLogging,QlogOutput,SignpostOutput
-        Build-Reductive-Traits: swift build --build-tests --quiet --traits DisableDebugLogging,DisableErrorLogging
-        Test-Debug: swift test --quiet
-        Test-Release: swift test --quiet -c release
+        Build: swift build --build-tests
+        Build-Additive-Traits: swift build --build-tests --traits DatapathLogging,QlogOutput,SignpostOutput
+        Build-Reductive-Traits: swift build --build-tests --traits DisableDebugLogging,DisableErrorLogging
+        Test-Debug: swift test
+        Test-Release: swift test -c release
       linux_static_sdk_versions: '["6.4"]'
 
       # Android
@@ -66,6 +66,32 @@ jobs:
       enable_embedded_wasm_sdk_build: false
       enable_cxx_interop: false
       enable_freebsd: false
+
+  benchmarks-linux:
+    # `SWIFT_DETERMINISTIC_HASHING` fixes the hash seed; otherwise retain and release counts vary
+    # from run to run and cannot hold a threshold.
+    name: Benchmarks (Linux)
+    uses: swiftlang/github-workflows/.github/workflows/benchmarks.yml@0.0.18
+    with:
+      name: benchmarks-linux
+      benchmark_package_paths: '["Benchmarks"]'
+      swift_package_arguments: "--disable-sandbox"
+      linux_swift_versions: '["6.4", "nightly-release", "nightly-main"]'
+      linux_env_vars: '{"SWIFT_DETERMINISTIC_HASHING": "1"}'
+
+  benchmarks-macos:
+    # The threshold path has no operating-system component, so this job is named by Xcode version
+    # to keep its directory apart from the Linux jobs'.
+    name: Benchmarks (macOS)
+    uses: swiftlang/github-workflows/.github/workflows/benchmarks.yml@0.0.18
+    with:
+      name: benchmarks-macos
+      benchmark_package_paths: '["Benchmarks"]'
+      swift_package_arguments: "--disable-sandbox"
+      enable_linux: false
+      enable_macos: true
+      macos_xcode_versions: '["latest-beta"]'
+      macos_env_vars: '{"SWIFT_DETERMINISTIC_HASHING": "1"}'
 
   soundness:
     name: Soundness
